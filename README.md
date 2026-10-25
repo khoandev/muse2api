@@ -170,6 +170,16 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+Prebuilt images are published to GHCR on every push to `master` (Linux `amd64` + `arm64`):
+
+```bash
+docker run -d --name muse2api --restart unless-stopped \
+  --env-file .env -p 18610:18610 -v "$PWD/data:/app/data" --shm-size=1g \
+  ghcr.io/khoandev/muse2api:latest
+```
+
+`ghcr.io/khoandev/muse2api:sha-<commit>` pins a specific build.
+
 ### Use a real account (browser driver)
 
 1. Install Chromium or Chrome and set `MUSE2API_DRIVER=browser` in `.env`.

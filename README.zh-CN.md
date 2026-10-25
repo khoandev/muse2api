@@ -170,6 +170,16 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+每次 push 到 `master` 都会构建镜像并推送到 GHCR（Linux `amd64` + `arm64`）：
+
+```bash
+docker run -d --name muse2api --restart unless-stopped \
+  --env-file .env -p 18610:18610 -v "$PWD/data:/app/data" --shm-size=1g \
+  ghcr.io/khoandev/muse2api:latest
+```
+
+`ghcr.io/khoandev/muse2api:sha-<commit>` 可固定到某个提交的构建。
+
 ### 用真实账号（浏览器 driver）
 
 1. 装好 Chromium 或 Chrome，在 `.env` 里设置 `MUSE2API_DRIVER=browser`。
