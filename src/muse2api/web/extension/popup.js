@@ -17,7 +17,8 @@ const STORE_KEY = "muse2api_ext_cfg";
 const LANG_KEY = "muse2api_ext_lang";
 
 // Core httpOnly cookies required for generation.
-const ESSENTIAL = ["hatch_sess", "hatch_gw", "hatch_vml", "hatch_native_auth_device"];
+// hatch_gw / hatch_vml are optional: muse.ai no longer sets them for every session.
+const ESSENTIAL = ["hatch_sess", "hatch_native_auth_device"];
 
 // ---- i18n ----
 const LANG_STRINGS = {
@@ -209,6 +210,13 @@ async function run() {
     }
 
     log(s("uploading", { n: names.length, base }));
+
+    const origin = new URL(base).origin + "/*";
+    const allowed = await chrome.permissions.request({ origins: [origin] });
+    if (!allowed) {
+      log("Allow the extension to access " + new URL(base).origin + ", then click again.", "bad");
+      return;
+    }
 
     const res = await fetch(base + "/admin/accounts", {
       method: "POST",
