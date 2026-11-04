@@ -9,6 +9,7 @@ import pytest
 
 from muse2api.accounts import Account
 from muse2api.config import Settings
+from muse2api.drivers.base import ChatRequest
 from muse2api.drivers.browser.driver import BrowserDriver, _Tab
 
 
@@ -217,3 +218,315 @@ async def test_quota_hint_only_counts_in_the_finished_reply(driver):
              "lastText": "You've reached your usage limit. Try again later.", "generating": False}
     with pytest.raises(UpstreamQuotaError, match="usage limit"):
         await driver._state(_media_tab([quota]))
+
+
+async def _run_begin_chat(driver, monkeypatch, tab, req, on_thread=True):
+    """Drive _begin_chat with CDP-touching steps stubbed; returns (sent, new_thread)."""
+    sent = []
+    new_thread = []
+
+    async def fake_new(t):
+        new_thread.append(t)
+
+    async def fake_state(t):
+        return {}
+
+    async def fake_attach(t, images):
+        pass
+
+    async def fake_send(t, prompt):
+        sent.append(prompt)
+
+    async def fake_on(t):
+        return on_thread
+
+    async def spy_checkout(account, prefer=None):
+        spy_checkout.prefer = prefer
+        return tab
+
+    monkeypatch.setattr(driver, "_checkout", spy_checkout)
+    monkeypatch.setattr(driver, "_new_thread", fake_new)
+    monkeypatch.setattr(driver, "_state", fake_state)
+    monkeypatch.setattr(driver, "_attach", fake_attach)
+    monkeypatch.setattr(driver, "_send", fake_send)
+    monkeypatch.setattr(driver, "_on_thread", fake_on)
+    await driver._begin_chat(ACC, req)
+    return sent, new_thread, spy_checkout.prefer
+
+
+async def test_anonymous_chat_prefers_a_stateless_tab(driver, monkeypatch):
+    fresh = _Tab(ACC.id, "ctx", "t0", _FakeSession())
+    sent, _, prefer = await _run_begin_chat(
+        driver, monkeypatch, fresh,
+        ChatRequest(prompt="hi", model="muse-chat", turns=[("user", "hi")]),
+    )
+    used = _Tab(ACC.id, "ctx", "t1", _FakeSession())
+    used.hint, used.turns = "", [("user", "hi")]
+    assert prefer(used) is False
+    assert prefer(fresh) is True
+    assert sent == ["hi"]  # new thread, full prompt
+
+
+async def test_anonymous_chat_never_continues_an_unowned_thread(driver, monkeypatch):
+    # History lines up with the tab's thread, but with no `user` there is no
+    # way to know it is the same client, so it must not continue it.
+    tab = _Tab(ACC.id, "ctx", "t0", _FakeSession())
+    tab.hint, tab.turns = "", [("user", "hi")]
+    tab.thread_url = "https://muse.ai/chat/abc"
+    sent, new_thread, _ = await _run_begin_chat(
+        driver, monkeypatch, tab,
+        ChatRequest(prompt="FULL", model="muse-chat",
+                    turns=[("user", "hi"), ("assistant", "hello"), ("user", "more")]),
+    )
+    assert new_thread  # opened a new thread instead of continuing
+    assert sent == ["FULL"]  # full prompt, not the "more" delta
+
+
+async def test_named_chat_still_continues_its_thread(driver, monkeypatch):
+    tab = _Tab(ACC.id, "ctx", "t0", _FakeSession())
+    tab.hint, tab.turns = "alice", [("user", "hi")]
+    tab.thread_url = "https://muse.ai/chat/abc"
+    sent, new_thread, _ = await _run_begin_chat(
+        driver, monkeypatch, tab,
+        ChatRequest(prompt="FULL", model="muse-chat", conversation_hint="alice",
+                    turns=[("user", "hi"), ("assistant", "hello"), ("user", "more")]),
+    )
+    assert not new_thread
+    assert sent == ["more"]  # only the delta, on the same thread
+
+
+async def _finish_chat(driver, fast, monkeypatch, req):
+    """Run chat_stream to a finished reply on a fake thread; returns (tab, account)."""
+    account = Account(id="a1", cookies={"hatch_sess": "x"})
+    tab = _Tab(account.id, "ctx", "t0", _FakeSession())
+    tab.busy = True
+
+    async def begin(acc, r):
+        return tab, {"agentCount": 0, "lastText": ""}
+
+    async def state(t):
+        return {"agentCount": 1, "lastText": "hello", "generating": False}
+
+    async def href(t):
+        return "https://muse.ai/thread/abc"
+
+    monkeypatch.setattr(driver, "_begin_chat", begin)
+    monkeypatch.setattr(driver, "_state", state)
+    monkeypatch.setattr(driver, "_href", href)
+    assert [d async for d in driver.chat_stream(account, req)] == ["hello"]
+    return tab, account
+
+
+async def test_anonymous_reply_is_not_kept(driver, fast, monkeypatch):
+    tab, account = await _finish_chat(driver, fast, monkeypatch,
+                                      ChatRequest(prompt="hi", model="muse-chat", turns=[("user", "hi")]))
+    assert not tab.has_state and not tab.busy
+    assert "hot_page" not in account.meta
+
+
+async def test_named_reply_is_kept_for_the_next_turn(driver, fast, monkeypatch):
+    tab, account = await _finish_chat(
+        driver, fast, monkeypatch,
+        ChatRequest(prompt="hi", model="muse-chat", conversation_hint="k:alice", turns=[("user", "hi")]))
+    assert tab.hint == "k:alice" and tab.thread_url == "https://muse.ai/thread/abc"
+    assert account.meta["hot_page"]["hint"] == "k:alice"
+
+
+async def test_anonymous_chat_does_not_restore_the_saved_thread(driver, monkeypatch):
+    tab = _Tab(ACC.id, "ctx", "t0", _FakeSession())
+    account = Account(id="a2", cookies={"hatch_sess": "x"},
+                      meta={"hot_page": {"hint": "k:alice", "turns": [["user", "hi"]],
+                                         "url": "https://muse.ai/thread/abc", "image_count": 0}})
+    monkeypatch.setattr(driver, "_checkout", lambda acc, prefer=None: _ready(tab))
+    for name in ("_new_thread", "_attach", "_send"):
+        monkeypatch.setattr(driver, name, _noop)
+    monkeypatch.setattr(driver, "_state", lambda t: _ready({}))
+    await driver._begin_chat(account, ChatRequest(prompt="hi", model="muse-chat", turns=[("user", "hi")]))
+    assert not tab.has_state  # alice's saved thread stays out of an anonymous tab
+    assert account.meta["hot_page"]["hint"] == "k:alice"
+
+
+async def _ready(value):
+    return value
+
+
+async def _noop(*args, **kwargs):
+    return None
+
+
+# ---- opening a blank thread ----
+
+class _NavSession(_FakeSession):
+    """A muse.ai page whose router either lands on an empty /thread/new or is missing."""
+
+    def __init__(self, router: bool) -> None:
+        self.router = router
+        self.sent: list[str] = []
+
+    async def evaluate(self, expr, **_):
+        from muse2api.drivers.browser import dom
+
+        if expr == dom.SOFT_NEW_THREAD:
+            return self.router
+        if expr == dom.FRESH_THREAD:
+            return True
+        if expr == dom.PAGE_STATE:
+            return {"ready": True}
+        return {}
+
+    async def send(self, method, params=None, **_):
+        self.sent.append(method)
+        return {}
+
+
+async def test_new_thread_uses_the_page_router_without_reloading(driver, fast):
+    tab = _Tab("a0", "ctx", "t", _NavSession(router=True))
+    tab.turns, tab.thread_url = [("user", "hi")], "https://muse.ai/thread/x"
+    await driver._new_thread(tab)
+    assert tab.session.sent == []
+    assert not tab.has_state
+
+
+async def test_new_thread_falls_back_to_a_full_navigation(driver, fast):
+    tab = _Tab("a0", "ctx", "t", _NavSession(router=False))
+    await driver._new_thread(tab)
+    assert tab.session.sent == ["Page.navigate"]
+
+
+# ---- warm threads ----
+
+async def test_chat_goes_into_a_warm_thread_without_opening_one(driver, monkeypatch):
+    tab = _Tab(ACC.id, "ctx", "t0", _FakeSession())
+    tab.warm = True
+    sent, new_thread, _ = await _run_begin_chat(
+        driver, monkeypatch, tab,
+        ChatRequest(prompt="FULL", model="muse-chat", turns=[("user", "hi")]),
+    )
+    assert not new_thread
+    assert sent == ["FULL"]
+    assert not tab.warm  # used up
+
+
+async def test_checkout_hands_out_a_warm_tab_first(driver):
+    cold, warm = await driver._checkout(ACC), await driver._checkout(ACC)
+    warm.warm = True
+    await driver._checkin(cold)
+    await driver._checkin(warm)
+    assert await driver._checkout(ACC, prefer=lambda t: not t.has_state) is warm
+
+
+async def test_media_leaves_a_warm_tab_alone(driver, monkeypatch):
+    warm = await driver._checkout(ACC)
+    warm.warm = True
+    await driver._checkin(warm)
+    taken = []
+
+    async def prepare(tab, prompt, images):
+        taken.append(tab)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(driver, "_prepare", prepare)
+    with pytest.raises(RuntimeError):
+        await driver._generate(ACC, "a cat", [], "image", 1, None, None)
+    assert taken and taken[0] is not warm and warm.warm
+
+
+async def test_warming_keeps_a_slot_free_for_real_requests(tmp_path, monkeypatch):
+    drv = BrowserDriver(Settings(_env_file=None, data_dir=tmp_path, account_max_concurrency=2,
+                                 warm_threads=1))
+    ids = itertools.count()
+
+    async def fake_open(account):
+        return _Tab(account.id, "ctx", f"t{next(ids)}", _FakeSession())
+
+    monkeypatch.setattr(drv, "_open_tab", fake_open)
+    busy = await drv._checkout(ACC)
+    assert await drv._checkout_for_warming(ACC) is None  # one slot left: keep it for a request
+    await drv._checkin(busy)
+    tab = await drv._checkout_for_warming(ACC)
+    assert tab is not None and tab.busy
+    tab.warm = True
+    await drv._checkin(tab)
+    assert await drv._checkout_for_warming(ACC) is None  # enough warm threads
+
+
+class _CookieSession(_FakeSession):
+    def __init__(self) -> None:
+        self.cookies: dict[str, str] = {}
+
+    async def send(self, method, params=None, **_):
+        if method == "Network.setCookie":
+            self.cookies[params["name"]] = params["value"]
+        return {}
+
+
+async def test_renewal_rotates_cookies_in_place_and_keeps_tabs(driver, monkeypatch):
+    from muse2api.drivers.base import SessionInfo
+    from muse2api.drivers.browser import driver as mod
+
+    async def renew(cookies, **_):
+        return SessionInfo(ok=True, cookies={"hatch_sess": "rotated"})
+
+    monkeypatch.setattr(mod.muse, "renew_session", renew)
+    tab = await driver._checkout(ACC)
+    tab.session = _CookieSession()
+    tab.warm = True
+    await driver._checkin(tab)
+    await driver.renew_session(ACC)
+    assert tab.session.cookies["hatch_sess"] == "rotated"
+    assert not tab.closed and not tab.stale and tab.warm
+
+
+async def test_new_named_conversation_takes_the_warm_tab_not_a_new_one(driver):
+    warm = await driver._checkout(ACC)
+    warm.warm = True
+    await driver._checkin(warm)
+    taken = []
+
+    async def stop(t):
+        taken.append(t)
+        raise RuntimeError("stop")
+
+    driver._state = stop
+    with pytest.raises(RuntimeError):
+        await driver._begin_chat(ACC, ChatRequest(prompt="hi", model="muse-chat",
+                                                  conversation_hint="k:bob", turns=[("user", "hi")]))
+    assert taken == [warm]
+
+
+async def test_missing_warm_threads_are_taken_together(tmp_path, monkeypatch):
+    drv = BrowserDriver(Settings(_env_file=None, data_dir=tmp_path, account_max_concurrency=6,
+                                 warm_threads=3))
+    ids = itertools.count()
+
+    async def fake_open(account):
+        return _Tab(account.id, "ctx", f"t{next(ids)}", _FakeSession())
+
+    monkeypatch.setattr(drv, "_open_tab", fake_open)
+    batch = []
+    while (tab := await drv._checkout_for_warming(ACC, len(batch))) is not None:
+        batch.append(tab)
+    assert len(batch) == 3 and len({t.target_id for t in batch}) == 3
+
+
+async def test_a_failed_warm_round_is_retried(tmp_path, monkeypatch, fast):
+    drv = BrowserDriver(Settings(_env_file=None, data_dir=tmp_path, account_max_concurrency=4,
+                                 warm_threads=1))
+    ids = itertools.count()
+
+    async def fake_open(account):
+        return _Tab(account.id, "ctx", f"t{next(ids)}", _FakeSession())
+
+    attempts = []
+
+    async def warm_up(tab):
+        attempts.append(tab)
+        if len(attempts) == 1:
+            raise RuntimeError("page did not become ready")
+        tab.warm = True
+
+    monkeypatch.setattr(drv, "_open_tab", fake_open)
+    monkeypatch.setattr(drv, "_warm_up", warm_up)
+    await drv._fill_warm(ACC)
+    assert len(attempts) == 2
+    assert sum(t.warm for t in drv._tabs[ACC.id]) == 1

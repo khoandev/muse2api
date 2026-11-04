@@ -7,7 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DriverName = Literal["mock", "browser", "http"]
@@ -61,10 +61,18 @@ class Settings(BaseSettings):
     )
     browser_profile_dir: Path | None = None
     page_ready_timeout: float = 45.0
+    warm_threads: int = Field(
+        default=2,
+        description="Pre-started muse.ai threads kept per account. A new thread takes muse.ai "
+        "20-40s to answer its first message, a started one about 5s, so a chat that opens a new "
+        "thread goes into a warm one instead. Each costs one extra short message of quota. "
+        "Needs MUSE2API_ACCOUNT_MAX_CONCURRENCY of at least 2; 0 disables.",
+    )
+    warm_prompt: str = Field(default="Hi", description="Message that starts a warm thread.")
 
     # --- timeouts (seconds) ---
     chat_timeout: float = 300.0
-    first_token_timeout: float = 45.0
+    first_token_timeout: float = 75.0
     stream_heartbeat_interval: float = Field(
         default=0.0,
         description="SSE ': keepalive' comment interval while waiting for the first "
@@ -76,7 +84,7 @@ class Settings(BaseSettings):
     # --- account pool ---
     pool_strategy: PoolStrategyName = "affinity"
     pool_acquire_timeout: float = 60.0
-    account_max_concurrency: int = 1
+    account_max_concurrency: int = 4
     account_cooldown: float = 120.0
     max_failover: int = 2
 
@@ -88,8 +96,17 @@ class Settings(BaseSettings):
     )
 
     # --- keepalive (session renewal) ---
-    keepalive_enabled: bool = False
-    keepalive_interval: float = 6 * 3600
+    keepalive_enabled: bool = True
+    keepalive_interval: float = 600
+
+    @field_validator("browser_profile_dir", mode="before")
+    @classmethod
+    def _blank_profile_dir_is_unset(cls, value: object) -> object:
+        """``.env.example`` ships ``MUSE2API_BROWSER_PROFILE_DIR=``; ``Path("")`` would be the
+        working directory, so Chrome would scatter its profile across the repo root."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @property
     def media_dir(self) -> Path:

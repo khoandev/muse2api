@@ -57,6 +57,8 @@ STABLE_POLLS_DONE = 4
 STABLE_POLLS_FORCE = 12
 # Past this many assistant bubbles the page gets slow and a new thread is cheaper.
 HOT_BUBBLE_LIMIT = 16
+# A new thread often shows "Connecting..." for 10-30s and then answers normally.
+STALL_GIVE_UP = 45.0
 QUOTA_CACHE_SECONDS = 1800.0
 
 
@@ -94,6 +96,8 @@ class _Tab:
     thread_url: str = ""
     quota_note: str = ""
     """Last ignored quota-hint snippet, so a page polled every 0.6s logs it once."""
+    warm: bool = False
+    """The page shows a started thread holding only the warm-up exchange."""
     busy: bool = False
     stale: bool = False
     """Cookies were renewed; close this tab once it is idle."""
@@ -125,6 +129,7 @@ class BrowserDriver(MuseDriver):
         # Last quota snapshot per account (see ``quota``) and the lock serialising reads.
         self._quota_cache: dict[str, dict[str, Any]] = {}
         self._quota_locks: dict[str, asyncio.Lock] = {}
+        self._warming: dict[str, asyncio.Task] = {}
 
     # ------------------------------------------------------------ lifecycle
     async def startup(self) -> None:
@@ -138,6 +143,8 @@ class BrowserDriver(MuseDriver):
         log.info("browser driver ready")
 
     async def shutdown(self) -> None:
+        for task in self._warming.values():
+            task.cancel()
         for tabs in list(self._tabs.values()):
             for tab in list(tabs):
                 await self._close_tab(tab)
@@ -168,7 +175,8 @@ class BrowserDriver(MuseDriver):
                           if t.closed or (not t.busy and (t.stale or t.session.closed))]:
                     tabs.remove(t)
                     dead.append(t)
-                idle = [t for t in tabs if not t.busy]
+                # A warm tab first: whoever needs a new thread gets a started one.
+                idle = sorted((t for t in tabs if not t.busy), key=lambda t: not t.warm)
                 can_open = len(tabs) + self._opening.get(account.id, 0) < limit
                 match = next((t for t in idle if prefer is None or prefer(t)), None)
                 if match or (idle and not can_open):
@@ -291,6 +299,7 @@ class BrowserDriver(MuseDriver):
 
     @staticmethod
     def _forget(tab: _Tab) -> None:
+        tab.warm = False
         tab.hint = None
         tab.turns = []
         tab.image_count = 0
@@ -356,8 +365,25 @@ class BrowserDriver(MuseDriver):
             return False
         return (state.get("agentCount") or 0) < HOT_BUBBLE_LIMIT
 
+    _SOFT_NAV_TIMEOUT = 8.0
+
+    async def _soft_new_thread(self, tab: _Tab) -> bool:
+        """Switch an already loaded muse.ai page to a blank thread without reloading it.
+        False means the caller should fall back to a full navigation."""
+        with contextlib.suppress(CDPError, TimeoutError):
+            if not await tab.session.evaluate(dom.SOFT_NEW_THREAD, timeout=5.0):
+                return False
+            deadline = time.monotonic() + self._SOFT_NAV_TIMEOUT
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.25)
+                if await tab.session.evaluate(dom.FRESH_THREAD, timeout=5.0):
+                    return True
+        return False
+
     async def _new_thread(self, tab: _Tab) -> None:
         self._forget(tab)
+        if await self._soft_new_thread(tab):
+            return
         await tab.session.send("Page.navigate", {"url": muse.NEW_THREAD_URL})
         deadline = time.monotonic() + self.settings.page_ready_timeout
         state: dict = {}
@@ -462,6 +488,7 @@ class BrowserDriver(MuseDriver):
         return bool(present)
 
     async def _open_saved(self, tab: _Tab) -> None:
+        tab.warm = False
         await tab.session.send("Page.navigate", {"url": tab.thread_url})
         deadline = time.monotonic() + self.settings.page_ready_timeout
         while time.monotonic() < deadline:
@@ -473,14 +500,31 @@ class BrowserDriver(MuseDriver):
     async def _begin_chat(self, account: Account, req: ChatRequest):
         """Send ``req`` on the saved conversation when it continues that page."""
         hint = req.conversation_hint or ""
-        tab = await self._checkout(account, prefer=lambda t: t.has_state and (t.hint or "") == hint)
+        if hint:
+            # A named conversation reuses the tab already holding it; a new one takes
+            # a warm thread rather than opening a cold tab.
+            def owned(t: _Tab) -> bool:
+                return t.has_state and (t.hint or "") == hint
+
+            has_own = any(owned(t) for t in self._tabs.get(account.id, []))
+            tab = await self._checkout(account, prefer=owned if has_own else (lambda t: owned(t) or t.warm))
+        else:
+            # No identity (no `user` field): never latch onto a tab another
+            # anonymous request was using, or two clients without `user`
+            # would share one thread. Prefer a fresh/stateless tab instead.
+            tab = await self._checkout(account, prefer=lambda t: not t.has_state)
         prompt, images = req.prompt, req.images
         try:
             # The saved conversation (restored after a restart) may only go into a
             # tab while no other tab of the account already holds a conversation.
-            if not any(t.has_state for t in self._tabs.get(account.id, []) if t is not tab):
+            if hint and not any(t.has_state for t in self._tabs.get(account.id, []) if t is not tab):
                 self._load_hot(tab, account)
-            same_owner = (tab.hint or "") == (req.conversation_hint or "")
+            # An anonymous request never continues a thread, even if the tab
+            # it got (e.g. the at-limit fallback, or a restored hot page)
+            # happens to hold one: without an identity there is no way to
+            # know it is the same client. It opens a new thread instead and
+            # sends the full prompt, which keeps the model in context.
+            same_owner = bool(hint) and (tab.hint or "") == hint
             follow = followup_text(tab.turns, req.turns) if tab.turns and same_owner else None
             if follow and len(req.images) >= tab.image_count and (
                 tab.thread_url or await self._live_continuation(tab)
@@ -493,11 +537,15 @@ class BrowserDriver(MuseDriver):
                 prompt = follow
                 images = req.images[tab.image_count:]
             else:
-                log.info("opening a new thread")
                 saved = account.meta.get("hot_page")
                 if isinstance(saved, dict) and (saved.get("hint") or "") == hint:
                     account.meta.pop("hot_page", None)
-                await self._new_thread(tab)
+                if tab.warm:
+                    log.info("using a warm thread")
+                    self._forget(tab)
+                else:
+                    log.info("opening a new thread")
+                    await self._new_thread(tab)
             base = await self._state(tab)
             await self._attach(tab, images)
             await self._send(tab, prompt)
@@ -534,7 +582,7 @@ class BrowserDriver(MuseDriver):
                 text = st.get("lastText", "")
                 is_new = st.get("agentCount", 0) > base_count or (text and text != base_text)
                 if not is_new or not text:
-                    if elapsed > 15 and any(h in st.get("tail", "") for h in dom.STALL_HINTS):
+                    if elapsed > STALL_GIVE_UP and any(h in st.get("tail", "") for h in dom.STALL_HINTS):
                         raise UpstreamTimeout("upstream workspace is stuck connecting")
                     continue
                 got_first = True
@@ -553,7 +601,9 @@ class BrowserDriver(MuseDriver):
             await self._close_tab(tab)
             raise UpstreamError(f"browser error: {exc}") from exc
         finally:
-            if finished:
+            # Only a named conversation is kept: an anonymous one can never be
+            # continued, so holding it would just keep the tab from counting as fresh.
+            if finished and req.conversation_hint:
                 url = ""
                 for _ in range(10):
                     url = await self._href(tab)
@@ -568,6 +618,91 @@ class BrowserDriver(MuseDriver):
             else:
                 self._forget(tab)
             await self._checkin(tab)
+            self.prewarm(account)
+
+    # ------------------------------------------------------------ warm threads
+    _WARM_REPLY_TIMEOUT = 90.0
+    _WARM_RETRY_DELAY = 60.0
+    _WARM_MAX_FAILED_ROUNDS = 3
+
+    def prewarm(self, account: Account) -> None:
+        """Top up ``account``'s warm threads in the background (``MUSE2API_WARM_THREADS``)."""
+        if self.settings.warm_threads <= 0 or self._browser is None:
+            return
+        task = self._warming.get(account.id)
+        if task and not task.done():
+            return
+        self._warming[account.id] = asyncio.create_task(self._fill_warm(account))
+
+    async def _fill_warm(self, account: Account) -> None:
+        """Warm the missing threads in parallel, round after round, until the account has
+        enough. A failed round (a cold page load often times out) is retried after a
+        pause, up to ``_WARM_MAX_FAILED_ROUNDS`` in a row."""
+        failed = 0
+        while True:
+            batch: list[_Tab] = []
+            while (tab := await self._checkout_for_warming(account, len(batch))) is not None:
+                batch.append(tab)
+            if not batch:
+                return
+            results = await asyncio.gather(*(self._warm_one(account, t) for t in batch))
+            if all(results):
+                failed = 0
+                continue
+            failed += 1
+            if failed >= self._WARM_MAX_FAILED_ROUNDS:
+                return
+            await asyncio.sleep(self._WARM_RETRY_DELAY)
+
+    async def _warm_one(self, account: Account, tab: _Tab) -> bool:
+        try:
+            await self._warm_up(tab)
+        except Exception as exc:  # noqa: BLE001
+            self._forget(tab)
+            if isinstance(exc, CDPError):
+                await self._close_tab(tab)
+            log.warning("warming a thread for %s failed: %s", account.id, exc)
+            return False
+        finally:
+            await self._checkin(tab)
+        log.info("warm thread ready for account %s", account.id)
+        return True
+
+    async def _checkout_for_warming(self, account: Account, pending: int = 0) -> _Tab | None:
+        """A tab to warm, but only while the account has warm threads missing (counting
+        the ``pending`` ones being warmed) and a slot is still left for a real request."""
+        limit = max(1, self.settings.account_max_concurrency)
+        async with self._tab_cond:
+            tabs = [t for t in self._tabs.get(account.id, []) if not t.closed]
+            if sum(t.warm for t in tabs) + pending >= self.settings.warm_threads:
+                return None
+            idle = [t for t in tabs if not (t.busy or t.stale or t.session.closed)]
+            free = len(idle) + limit - len(tabs) - self._opening.get(account.id, 0)
+            if free < 2:
+                return None
+        return await self._checkout(account, prefer=lambda t: not t.has_state and not t.warm)
+
+    async def _warm_up(self, tab: _Tab) -> None:
+        await self._new_thread(tab)
+        base = (await self._state(tab)).get("agentCount", 0)
+        await self._send(tab, self.settings.warm_prompt)
+        deadline = time.monotonic() + self._WARM_REPLY_TIMEOUT
+        last, stable = None, 0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(POLL_INTERVAL)
+            st = await self._state(tab)
+            if st.get("approval"):
+                await self._deny_approvals(tab)
+                continue
+            text = st.get("lastText", "")
+            if st.get("agentCount", 0) <= base or not text:
+                continue
+            if text != last:
+                last, stable = text, 0
+            elif not st.get("generating") and (stable := stable + 1) >= STABLE_POLLS_DONE:
+                tab.warm = True
+                return
+        raise UpstreamTimeout("no reply to the warm-up message")
 
     # ------------------------------------------------------------ media
     @staticmethod
@@ -698,8 +833,9 @@ class BrowserDriver(MuseDriver):
 
     async def _generate(self, account: Account, prompt: str, images: list[InputImage],
                         kind: str, timeout: float, on_progress, cancel) -> MediaResult:
-        # Media always starts a fresh thread, so keep tabs holding a chat for chats.
-        tab = await self._checkout(account, prefer=lambda t: not t.has_state)
+        # Media always starts a fresh thread, so keep tabs holding a chat (or a warm
+        # thread) for chats.
+        tab = await self._checkout(account, prefer=lambda t: not t.has_state and not t.warm)
         try:
             base = await self._prepare(tab, prompt, images)
             att = await self._wait_media(tab, base, kind, timeout, on_progress, cancel)
@@ -729,8 +865,21 @@ class BrowserDriver(MuseDriver):
     # ------------------------------------------------------------ session
     async def renew_session(self, account: Account) -> SessionInfo:
         info = await muse.renew_session(account.cookies)
-        # Retire the account's tabs so new ones load the rotated cookies; a tab
-        # in the middle of a request is closed when it is checked back in.
+        # Cookies live in the account's browser context, so writing the rotated ones
+        # through any open tab updates every tab and keeps hot and warm pages alive.
+        async with self._tab_cond:
+            live = [t for t in self._tabs.get(account.id, [])
+                    if not (t.closed or t.stale or t.session.closed)]
+        if live:
+            rotated = account.model_copy(update={
+                "cookies": {**account.cookies, **info.cookies},
+                "cookie_expires": {**account.cookie_expires, **info.cookie_expires},
+            })
+            with contextlib.suppress(CDPError, TimeoutError):
+                await self._set_cookies(live[0].session, rotated)
+                return info
+        # Otherwise retire the account's tabs so new ones load the rotated cookies; a
+        # tab in the middle of a request is closed when it is checked back in.
         async with self._tab_cond:
             tabs = list(self._tabs.get(account.id, []))
             for tab in tabs:

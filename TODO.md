@@ -22,7 +22,7 @@ Priorities: **P0** must be done first · **P1** core feature · **P2** better ex
 | B2 | Reuse conversation threads to cut first-token latency | P2 | `drivers/browser/` | | Done |
 | B3 | Quota lookup | P2 | `MuseDriver.quota` | | Partial (mock and browser driver done; http driver and quota-aware scheduling open) |
 | C1 | `/v1/responses` endpoint | P1 | `api/routes/responses.py` | | Done (local; verified with the official OpenAI SDK streaming + non-streaming against the mock driver; real-account check pending) |
-| C2 | `/v1/images/edits` endpoint | P1 | `api/routes/images.py` | | Not started |
+| C2 | `/v1/images/edits` endpoint | P1 | `api/routes/images.py` | | Done (SDK regression test in `tests/test_sdk_compat.py`; `mask` rejected, no inpainting) |
 | C3 | Emulated tool calling | P2 | `core/prompt.py` | | Not started |
 | C4 | Streaming heartbeats to avoid client timeouts | P2 | `api/routes/chat.py` | | Done |
 | D1 | Support more cookie import formats | P1 | `api/routes/admin.py` | | Done |
@@ -32,6 +32,9 @@ Priorities: **P0** must be done first · **P1** core feature · **P2** better ex
 | E1 | Automatic media cleanup | P2 | `core/media.py` | | Done |
 | E2 | Multiple API keys and rate limiting | P3 | `api/deps.py` | | Partial (per-key management done; rate limiting open) |
 | E3 | Observability (metrics, logs) | P3 | `observability/` (new) | | Not started |
+| F1 | Stateless-by-default chat: new thread + full history per request | P2 | `drivers/browser/driver.py` | | Done |
+| F2 | Stateful tab reuse as explicit opt-in (non-empty `user` only) | P2 | `drivers/browser/driver.py` | | Done |
+| F3 | Multi-user guidance: raise `account_max_concurrency`, isolate by API key | P3 | `api/deps.py`, docs | | Done |
 
 ---
 
@@ -115,6 +118,7 @@ Done. A follow-up whose `messages` continue the conversation already on the page
 - Parse the multipart form (`image` / `image[]`, `prompt`, `size`, `response_format`).
 - Put the uploaded images into `ImageRequest.reference_images` and reuse the response shaping from `generate_images`.
 - **Done when**: the official SDK's `client.images.edit()` works.
+- **Done (2026-10-25)**: `POST /v1/images/edits` takes multipart `image`/`image[]` + `prompt` and reuses the generations shaping; the official SDK's `client.images.edit()` is covered by `test_sdk_images_edit` in `tests/test_sdk_compat.py`. `mask` is rejected because muse.ai cannot inpaint a region.
 
 ### C3 Emulated tool calling · P2
 - muse.ai has no native function calling. The idea is to describe the available tools and an output format in the prompt, parse tool calls out of the reply, and convert them to OpenAI's `tool_calls` format.
@@ -166,3 +170,39 @@ Done. A follow-up whose `messages` continue the conversation already on the page
 ### E3 Observability · P3
 - Expose Prometheus metrics: request count, latency, first-token latency, per-account success/failure counts, queue wait time.
 - Structured request logs with a unique ID per request for troubleshooting.
+
+---
+
+## F. Conversation state
+
+Background: the browser driver reuses tabs keyed by the OpenAI `user` field
+(`conversation_hint`). Standard frontends usually do not send `user`, so
+anonymous requests used to latch onto each other's threads.
+
+### F1 Stateless-by-default chat · P2
+- Every request opens a new thread and sends the full flattened history, so
+  behaviour matches OpenAI's stateless contract and can never cross-talk.
+- Cost: multi-turn requests resend history (roughly (N+1)/2x tokens for N
+  rounds) plus per-request thread-creation latency.
+
+### F2 Stateful tab reuse as explicit opt-in · P2
+- Only reuse a tab's thread when the client passes a non-empty `user`, and
+  document `user` as the conversation key. Anonymous requests always take
+  the F1 path.
+
+### F3 Multi-user guidance · P3
+- Document raising `account_max_concurrency` so parallel conversations get
+  separate tabs instead of wiping each other on one tab, and consider
+  isolating tabs by API key as well as by `user`.
+
+**Done (2026-10-29)**:
+- F1: anonymous requests never continue a thread. `_begin_chat` prefers a
+  stateless tab, never restores the saved thread into it, and the follow-up
+  delta is only computed for a non-empty hint. After the reply the tab is
+  forgotten and nothing is written to `account.meta["hot_page"]`.
+- F2: only a non-empty `user` keeps the thread for the next turn.
+- F3: the conversation key is `<key_id>:<user>` (`api/deps.py`
+  `conversation_key`), so two API keys sending the same `user` never share a
+  thread. README "Multi-turn conversations" documents `user` and raising
+  `MUSE2API_ACCOUNT_MAX_CONCURRENCY`.
+- Regression tests in `tests/test_browser_tabs.py` and `tests/test_api.py`.
